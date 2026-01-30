@@ -1,77 +1,87 @@
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+
 import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
-import { GoogleGenerativeAI } from '@google/generative-ai'
 
-// Supabase
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-)
-
-// Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
-
-const ASSETS = [
-  'XAUUSD (Gold)',
-  'BTCUSD (Bitcoin)',
-  'DXY (US Dollar Index)',
-  'US10Y (US 10-Year Bond)',
-  'US100 (Nasdaq 100)',
-  'US30 (Dow Jones)',
-  'SPX500 (S&P 500)',
-  'EURUSD',
-  'GBPUSD',
-  'USDJPY'
-]
-
-export async function GET() {
+/**
+ * asset examples:
+ * - BTCUSD
+ * - ETHUSD
+ * - EURUSD
+ * - GBPUSD
+ */
+export async function GET(req: Request) {
   try {
-    const today = new Date().toISOString().split('T')[0]
-    const results: any[] = []
+    const { searchParams } = new URL(req.url)
+    const asset = (searchParams.get('asset') || '').toUpperCase()
 
-    const model = genAI.getGenerativeModel({
-      model: 'gemini-1.5-pro-002',
-      tools: [{ googleSearch: {} }]
-    })
-
-    for (const asset of ASSETS) {
-      const prompt = `
-Hãy sử dụng Google Search để tìm dữ liệu MỚI NHẤT (Live Data) về ${asset} hôm nay ${today}.
-Sau đó phân tích xu hướng trader chuyên nghiệp.
-
-Trả về JSON:
-{
-  "asset": "${asset}",
-  "sentiment": "Bullish" | "Bearish" | "Neutral",
-  "confidence": 85,
-  "summary": "Tin tức mới",
-  "buy_zone": "Vùng mua",
-  "sell_zone": "Vùng bán"
-}
-      `
-
-      try {
-        const result = await model.generateContent(prompt)
-        const text = result.response.text().replace(/```json|```/g, '').trim()
-        const data = JSON.parse(text)
-
-        await supabase.from('market_analysis').insert({
-          report_date: today,
-          asset_symbol: data.asset,
-          sentiment: data.sentiment,
-          confidence: data.confidence,
-          summary: data.summary,
-          buy_zone: data.buy_zone,
-          sell_zone: data.sell_zone
-        })
-
-        results.push(data)
-      } catch (e) {
-        console.error('Asset error:', asset, e)
-      }
+    if (!asset) {
+      return NextResponse.json(
+        { error: 'Missing asset param. Example: ?asset=BTCUSD' },
+        { status: 400 }
+      )
     }
 
-    return NextResponse.json({ success: true, data: results })
+    // ===== CRYPTO → BINANCE =====
+    if (asset === 'BTCUSD' || asset === 'ETHUSD') {
+      const symbol = asset.replace('USD', 'USDT')
+
+      const res = await fetch(
+        `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`,
+        { cache: 'no-store' }
+      )
+
+      if (!res.ok) throw new Error('Binance API error')
+
+      const j = await res.json()
+
+      return NextResponse.json({
+        asset,
+        type: 'crypto',
+        source: 'binance',
+        price: Number(j.lastPrice),
+        change24hPct: Number(j.priceChangePercent),
+        high24h: Number(j.highPrice),
+        low24h: Number(j.lowPrice),
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    // ===== FX / MACRO → ALPHAVANTAGE =====
+    if (asset.length === 6) {
+      const from = asset.slice(0, 3)
+      const to = asset.slice(3, 6)
+
+      const key = process.env.ALPHAVANTAGE_API_KEY
+      if (!key) throw new Error('Missing ALPHAVANTAGE_API_KEY')
+
+      const url =
+        `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE` +
+        `&from_currency=${from}&to_currency=${to}&apikey=${key}`
+
+      const res = await fetch(url, { cache: 'no-store' })
+      if (!res.ok) throw new Error('AlphaVantage API error')
+
+      const j = await res.json()
+      const data = j['Realtime Currency Exchange Rate']
+      if (!data) throw new Error('Invalid AlphaVantage response')
+
+      return NextResponse.json({
+        asset,
+        type: 'fx',
+        source: 'alphavantage',
+        price: Number(data['5. Exchange Rate']),
+        bid: Number(data['8. Bid Price']),
+        ask: Number(data['9. Ask Price']),
+        lastRefreshed: data['6. Last Refreshed'],
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    return NextResponse.json(
+      { error: `Unsupported asset: ${asset}` },
+      { status: 400 }
+    )
   } catch (e: any) {
     return NextResponse.json(
       { success: false, error: e.message },
