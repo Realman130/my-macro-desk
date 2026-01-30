@@ -1,91 +1,101 @@
-export const runtime = 'nodejs'
-export const dynamic = 'force-dynamic'
+import { NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-import { NextResponse } from 'next/server'
+// 1. Cấu hình
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY! 
+);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-/**
- * asset examples:
- * - BTCUSD
- * - ETHUSD
- * - EURUSD
- * - GBPUSD
- */
-export async function GET(req: Request) {
+const ASSETS = [
+  'BTCUSD', 'ETHUSD', // Crypto
+  'XAUUSD', // Gold
+  'EURUSD', 'GBPUSD', 'USDJPY' // Forex
+];
+
+// --- HÀM LẤY GIÁ THỰC TẾ (Sống còn) ---
+async function getRealtimePrice(asset: string) {
+    try {
+        // Mẹo: Dùng Binance lấy giá Gold (PAXG) tham khảo hoặc các nguồn Free khác nếu AlphaVantage hết lượt
+        // Ở đây mình ưu tiên Binance cho Crypto vì nó siêu nhanh và Free
+        if (asset === 'BTCUSD' || asset === 'ETHUSD') {
+            const symbol = asset.replace('USD', 'USDT');
+            const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+            const data = await res.json();
+            return parseFloat(data.price).toFixed(2);
+        }
+        
+        // Với Gold/Forex: Tạm thời dùng AlphaVantage (Nhớ là nó giới hạn 25 req/ngày)
+        // Nếu bạn chạy nhiều, hãy cân nhắc mua gói hoặc tìm API khác.
+        const key = process.env.ALPHAVANTAGE_API_KEY; 
+        if (key) { 
+            // Logic lấy giá AlphaVantage (như cũ)
+            const from = asset.slice(0, 3);
+            const to = asset.slice(3, 6);
+            const res = await fetch(`https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=${from}&to_currency=${to}&apikey=${key}`);
+            const data = await res.json();
+            const rate = data['Realtime Currency Exchange Rate']?.['5. Exchange Rate'];
+            return rate ? parseFloat(rate).toFixed(2) : null;
+        }
+    } catch (e) {
+        console.error(`Lỗi lấy giá ${asset}:`, e);
+    }
+    return null; // Trả về null nếu không lấy được
+}
+
+export async function GET(request: Request) {
   try {
-    const { searchParams } = new URL(req.url)
-    const asset = (searchParams.get('asset') || '').toUpperCase()
+    const today = new Date().toISOString().split('T')[0];
+    const results = [];
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    if (!asset) {
-      return NextResponse.json(
-        { error: 'Missing asset param. Example: ?asset=BTCUSD' },
-        { status: 400 }
-      )
+    for (const asset of ASSETS) {
+      // 1. LẤY GIÁ LIVE
+      let currentPrice = await getRealtimePrice(asset);
+      
+      // Nếu không lấy được giá (do lỗi API), dùng giá mặc định để AI không bị ngáo
+      const priceText = currentPrice ? `Giá hiện tại đang là: ${currentPrice}` : "Không lấy được giá live, hãy tự ước lượng";
+
+      // 2. GỬI CHO AI
+      const prompt = `
+        Bạn là chuyên gia HybridTrader đang sống ở năm 2026.
+        Dữ liệu thị trường: ${asset}. ${priceText}.
+        Phân tích xu hướng NGẮN GỌN.
+        Trả về JSON:
+        {
+          "asset": "${asset}",
+          "sentiment": "Bullish/Bearish/Neutral",
+          "confidence": 85,
+          "summary": "Nhận định (Bắt buộc nhắc đến giá ${currentPrice || 'này'} trong câu)",
+          "buy_zone": "Vùng mua (Dựa trên giá ${currentPrice})",
+          "sell_zone": "Vùng bán (Dựa trên giá ${currentPrice})"
+        }
+      `;
+
+      try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text().replace(/```json|```/g, '').trim(); 
+        const data = JSON.parse(text);
+
+        // 3. LƯU DATABASE
+        await supabase.from('market_analysis').insert({
+          report_date: today,
+          asset_symbol: data.asset,
+          sentiment: data.sentiment,
+          confidence: data.confidence,
+          summary: data.summary, 
+          buy_zone: data.buy_zone,
+          sell_zone: data.sell_zone
+        });
+        results.push(data);
+      } catch (err) { console.error(err); }
     }
 
-    // ===== CRYPTO → BINANCE =====
-    if (asset === 'BTCUSD' || asset === 'ETHUSD') {
-      const symbol = asset.replace('USD', 'USDT')
-
-      const res = await fetch(
-        `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`,
-        { cache: 'no-store' }
-      )
-
-      if (!res.ok) throw new Error('Binance API error')
-
-      const j = await res.json()
-
-      return NextResponse.json({
-        asset,
-        type: 'crypto',
-        source: 'binance',
-        price: Number(j.lastPrice),
-        change24hPct: Number(j.priceChangePercent),
-        high24h: Number(j.highPrice),
-        low24h: Number(j.lowPrice),
-        timestamp: new Date().toISOString(),
-      })
-    }
-
-    // ===== FX / MACRO → ALPHAVANTAGE =====
-    if (asset.length === 6) {
-      const from = asset.slice(0, 3)
-      const to = asset.slice(3, 6)
-
-      const key = process.env.ALPHAVANTAGE_API_KEY
-      if (!key) throw new Error('Missing ALPHAVANTAGE_API_KEY')
-
-      const url =
-        `https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE` +
-        `&from_currency=${from}&to_currency=${to}&apikey=${key}`
-
-      const res = await fetch(url, { cache: 'no-store' })
-      if (!res.ok) throw new Error('AlphaVantage API error')
-
-      const j = await res.json()
-      const data = j['Realtime Currency Exchange Rate']
-      if (!data) throw new Error('Invalid AlphaVantage response')
-
-      return NextResponse.json({
-        asset,
-        type: 'fx',
-        source: 'alphavantage',
-        price: Number(data['5. Exchange Rate']),
-        bid: Number(data['8. Bid Price']),
-        ask: Number(data['9. Ask Price']),
-        lastRefreshed: data['6. Last Refreshed'],
-        timestamp: new Date().toISOString(),
-      })
-    }
-
-    return NextResponse.json(
-      { error: `Unsupported asset: ${asset}` },
-      { status: 400 }
-    )
-  } catch (e: any) {
-    return NextResponse.json(
-      { success: false, error: e.message },
-      { status: 500 }
-    )
+    return NextResponse.json({ success: true, data: results });
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
