@@ -1,14 +1,12 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // Tắt kiểm tra TypeScript khi Build để tránh lỗi vặt
+  // Tắt kiểm tra TypeScript khi build (đã OK)
   typescript: {
     ignoreBuildErrors: true,
   },
-  // Tắt cả kiểm tra ESLint cho chắc ăn
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
+
+  // ⚠️ KHÔNG cấu hình eslint ở đây nữa (Next.js 16 đã bỏ)
 };
 
 export default nextConfig;
